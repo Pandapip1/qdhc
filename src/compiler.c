@@ -1,8 +1,38 @@
 /*
- * haskell-compiler: Haskell subset -> LLVM IR via tree-sitter + LLVM C API
+ * qdhc — Quick & Dirty Haskell Compiler
  *
- * Supported subset:
- *   - Integer literals and arithmetic (+, -, *, /, mod)
+ * Haskell subset -> native object file via tree-sitter + LLVM C API.
+ * Presents a GCC-compatible driver interface so that CMake (and any other
+ * build system that drives a C compiler) can use qdhc as a drop-in CC:
+ *
+ *   cmake -DCMAKE_C_COMPILER=/path/to/qdhc ...
+ *
+ * Driver behaviour:
+ *   • Input is a .hs file  → compile Haskell to a native .o (or executable)
+ *   • Input is a .c file, or -x c/c++ is set, or it's link-only, or -E →
+ *     delegate transparently to $QDHC_CC (default: cc) with all original args
+ *   • --version / -v       → print a GHC-flavoured version string and exit 0
+ *
+ * GCC-style flags recognised:
+ *   -c            compile only (produce .o, no link)
+ *   -o <file>     output path
+ *   -x <lang>     language override; non-haskell langs delegate to cc
+ *   -I<dir>       include path (accepted, ignored for Haskell)
+ *   -D<macro>     define     (accepted, ignored for Haskell)
+ *   -W...         warning    (accepted, ignored)
+ *   -O...         optimise   (accepted, ignored)
+ *   -std=...      standard   (accepted, ignored)
+ *   -f...         feature    (accepted, ignored)
+ *   -g            debug info (accepted, ignored)
+ *   -shared/-fPIC (accepted, ignored — qdhc produces static objects)
+ *   -M/-MM/-MF/-MD/-MDD  dependency tracking (delegate to cc)
+ *   -E            preprocess only (delegate to cc)
+ *   -S            assemble only (compile Haskell → .ll text as .s stand-in)
+ *   --run         (legacy) JIT-compile and execute in-process
+ *   --dump-dir D  (legacy/debug) write cst.txt + ir.ll to D
+ *
+ * Supported Haskell subset:
+ *   - Integer literals and arithmetic (+, -, *, div, mod, quot, rem)
  *   - Comparisons (==, /=, <, <=, >, >=) and boolean (&&, ||)
  *   - Top-level function definitions with multiple parameters
  *   - if/then/else (phi-node based SSA)
@@ -27,6 +57,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>   /* execvp, fork */
 
 #include <tree_sitter/api.h>
 #include <llvm-c/Core.h>
@@ -612,30 +645,185 @@ static void emit_main(CG *cg) {
     LLVMBuildRet(cg->b,LLVMConstInt(cg->i32,0,0));
 }
 
+/* ── CC-driver helpers ──────────────────────────────────────────────────── */
+
+/* Delegate all original argv to $QDHC_CC (default "cc") and exec it.
+   Never returns on success. */
+static void delegate_to_cc(int argc, char **argv) {
+    const char *cc = getenv("QDHC_CC");
+    if (!cc || !*cc) cc = "cc";
+    /* Build new argv: cc arg1 arg2 ... */
+    char **nargv = malloc(sizeof(char*) * (argc + 1));
+    nargv[0] = (char*)cc;
+    for (int i = 1; i < argc; i++) nargv[i] = argv[i];
+    nargv[argc] = NULL;
+    execvp(cc, nargv);
+    perror(cc);
+    exit(1);
+}
+
+/* Return true if path has extension ext (e.g. ".hs") */
+static bool has_ext(const char *path, const char *ext) {
+    size_t pl = strlen(path), el = strlen(ext);
+    if (pl < el) return false;
+    return strcmp(path + pl - el, ext) == 0;
+}
+
+/* Replace or append extension.  Caller must free result. */
+static char *replace_ext(const char *path, const char *newext) {
+    const char *dot = strrchr(path, '.');
+    const char *slash = strrchr(path, '/');
+    size_t base = (dot && (!slash || dot > slash)) ? (size_t)(dot - path) : strlen(path);
+    char *out = malloc(base + strlen(newext) + 1);
+    memcpy(out, path, base);
+    strcpy(out + base, newext);
+    return out;
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    bool do_run = false;
-    const char *dump_dir = NULL;
+    /* ── parse GCC-style flags ─────────────────────────────────────────── */
+    bool do_compile_only = false;   /* -c */
+    bool do_assemble_only = false;  /* -S */
+    bool do_preprocess_only = false;/* -E */
+    bool do_run = false;            /* --run  (legacy) */
+    const char *flag_output = NULL; /* -o <file> */
+    const char *flag_x = NULL;      /* -x <lang> */
+    const char *dump_dir = NULL;    /* --dump-dir <dir> (legacy/debug) */
 
-    /* Parse flags before positional args */
-    while(argc >= 2 && argv[1][0] == '-') {
-        if(!strcmp(argv[1], "--run")) {
-            do_run = true; argv++; argc--;
-        } else if(!strcmp(argv[1], "--dump-dir") && argc >= 3) {
-            dump_dir = argv[2]; argv += 2; argc -= 2;
-        } else {
-            break;
+    /* Collect non-flag positional inputs (source files, .o files, -l flags) */
+    const char *inputs[256]; int ninputs = 0;
+    const char *hs_input = NULL;    /* the single .hs source, if any */
+    bool has_non_hs_source = false; /* .c / .cpp / etc. */
+
+    for (int i = 1; i < argc; i++) {
+        char *a = argv[i];
+
+        /* ── version / help ── */
+        if (!strcmp(a, "--version") || !strcmp(a, "-dumpversion")) {
+            printf("qdhc 0.1.0 (Quick & Dirty Haskell Compiler, GHC-subset)\n");
+            return 0;
         }
+        if (!strcmp(a, "-dumpmachine")) {
+            /* Ask cc what its machine triple is */
+            FILE *p = popen("cc -dumpmachine 2>/dev/null", "r");
+            if (p) { char buf[128]={0}; fread(buf,1,127,p); pclose(p);
+                     char *nl=strchr(buf,'\n'); if(nl)*nl=0;
+                     if(*buf){ puts(buf); return 0; } }
+            puts("x86_64-linux-gnu"); return 0;
+        }
+        if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) {
+            fprintf(stderr, "qdhc 0.1.0 (Quick & Dirty Haskell Compiler)\n");
+            /* don't exit — -v is also passed during normal compilation */
+            continue;
+        }
+
+        /* ── flags that require us to delegate everything to cc ── */
+        if (!strcmp(a, "-E")) { do_preprocess_only = true; continue; }
+        if (!strcmp(a, "-M") || !strcmp(a, "-MM") || !strcmp(a, "-MG")) {
+            delegate_to_cc(argc, argv); /* never returns */
+        }
+
+        /* ── flags we consume ── */
+        if (!strcmp(a, "-c"))           { do_compile_only = true; continue; }
+        if (!strcmp(a, "-S"))           { do_assemble_only = true; continue; }
+        if (!strcmp(a, "--run"))        { do_run = true; continue; }
+        if (!strcmp(a, "--dump-dir") && i+1 < argc) { dump_dir = argv[++i]; continue; }
+
+        if (!strcmp(a, "-o") && i+1 < argc) { flag_output = argv[++i]; continue; }
+        if (!strncmp(a, "-o", 2) && a[2]) { flag_output = a+2; continue; }
+
+        if (!strcmp(a, "-x") && i+1 < argc) { flag_x = argv[++i]; continue; }
+        if (!strncmp(a, "-x", 2) && a[2])   { flag_x = a+2; continue; }
+
+        /* ── flags we silently accept (irrelevant for Haskell codegen) ── */
+        if (!strncmp(a,"-I",2) || !strncmp(a,"-D",2) || !strncmp(a,"-W",2) ||
+            !strncmp(a,"-O",2) || !strncmp(a,"-f",2) || !strncmp(a,"-m",2) ||
+            !strncmp(a,"-std=",5) || !strcmp(a,"-g") || !strcmp(a,"-shared") ||
+            !strcmp(a,"-fPIC") || !strcmp(a,"-fpic") || !strcmp(a,"-pipe") ||
+            !strncmp(a,"-MF",3) || !strncmp(a,"-MT",3) || !strncmp(a,"-MQ",3) ||
+            !strcmp(a,"-MD") || !strcmp(a,"-MMD") || !strcmp(a,"-MP") ||
+            !strcmp(a,"-pthread") || !strncmp(a,"--sysroot",9) ||
+            !strncmp(a,"-isystem",8) || !strncmp(a,"-isysroot",9) ||
+            !strncmp(a,"-target",7) || !strncmp(a,"--target",8))
+        {
+            continue;
+        }
+        /* -l<lib> and -L<dir>: linker flags, collected but ignored for .hs compiles */
+        if (!strncmp(a,"-l",2) || !strncmp(a,"-L",2) || !strcmp(a,"-rdynamic") ||
+            !strncmp(a,"-Wl,",4) || !strncmp(a,"-Xlinker",8))
+        { continue; }
+
+        /* ── positional: source / object inputs ── */
+        if (a[0] != '-') {
+            if (ninputs < 256) inputs[ninputs++] = a;
+            if (has_ext(a, ".hs")) {
+                hs_input = a;
+            } else if (!has_ext(a, ".o") && !has_ext(a, ".a") &&
+                       !has_ext(a, ".so") && !has_ext(a, ".dylib")) {
+                has_non_hs_source = true;
+            }
+            continue;
+        }
+
+        /* Unknown flag: pass through (will reach cc if we delegate) */
     }
-    if(argc<2){
+
+    /* ── decide dispatch ──────────────────────────────────────────────── */
+
+    /* -x overrides language: if it's not haskell, delegate */
+    bool x_is_haskell = !flag_x ||
+                        !strcmp(flag_x,"haskell") ||
+                        !strcmp(flag_x,"Haskell");
+
+    /* If the language is forced to non-haskell, or we have non-.hs source
+       with no .hs file at all, or preprocess-only: delegate everything */
+    if (do_preprocess_only || !x_is_haskell ||
+        (has_non_hs_source && !hs_input)) {
+        delegate_to_cc(argc, argv);
+    }
+
+    /* Link mode: no source at all, just .o/.a files */
+    if (!hs_input && ninputs > 0 && !has_non_hs_source) {
+        delegate_to_cc(argc, argv);
+    }
+
+    /* Nothing to do */
+    if (!hs_input) {
         fprintf(stderr,
-            "usage: qdhc [--run] [--dump-dir <dir>] <input.hs> [output.ll]\n"
+            "qdhc: no Haskell input file.\n"
+            "usage: qdhc [-c] [-o output] input.hs\n"
+            "       qdhc [GCC flags] input.hs        # as a CC replacement\n"
             "  --run           JIT-compile and execute in-process\n"
             "  --dump-dir DIR  write cst.txt and ir.ll to DIR for debugging\n");
         return 1;
     }
-    const char *inp=argv[1], *outp=argc>=3?argv[2]:"output.ll";
+
+    const char *inp = hs_input;
+
+    /* Determine output path */
+    char *outp_buf = NULL;
+    const char *outp;
+    if (flag_output) {
+        outp = flag_output;
+    } else if (do_compile_only) {
+        /* -c with no -o: replace .hs with .o in the current directory */
+        /* Use basename only — gcc puts foo.o in cwd, not next to source */
+        const char *base = strrchr(inp, '/');
+        base = base ? base+1 : inp;
+        outp_buf = replace_ext(base, ".o");
+        outp = outp_buf;
+    } else if (do_assemble_only) {
+        const char *base = strrchr(inp, '/');
+        base = base ? base+1 : inp;
+        outp_buf = replace_ext(base, ".s");
+        outp = outp_buf;
+    } else if (!do_run) {
+        outp = "a.out";
+    } else {
+        outp = NULL; /* run mode: no output file */
+    }
 
     FILE *f=fopen(inp,"rb"); if(!f){perror(inp);return 1;}
     fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
@@ -670,22 +858,28 @@ int main(int argc, char **argv) {
     memset(&sym,0,sizeof sym);
     first_pass(root,src);
 
-    if(sym.nfuncs==0){
-        fprintf(stderr,"error: no functions discovered in %s (imports, data, class, or instance only)\n", inp);
+    /* When compiling only (-c), a missing main is fine — it will be linked
+       in from another translation unit.  Only require main when producing
+       an executable. */
+    if (sym.nfuncs == 0) {
+        fprintf(stderr,"error: no functions discovered in %s "
+                "(imports, data, class, or instance only)\n", inp);
         ts_tree_delete(tree); ts_parser_delete(parser); free(src);
         exit(1);
     }
 
-    if(!sym_func("main")){
+    if (!do_compile_only && !sym_func("main")) {
         fprintf(stderr,"error: no 'main' function in %s\n", inp);
         ts_tree_delete(tree); ts_parser_delete(parser); free(src);
         exit(1);
     }
 
-    fprintf(stderr,"Functions discovered:\n");
-    for(int i=0;i<sym.nfuncs;i++)
-        fprintf(stderr,"  %-20s arity=%d\n",sym.funcs[i].name,sym.funcs[i].arity);
+    fprintf(stderr,"qdhc: %s — functions:", inp);
+    for (int i = 0; i < sym.nfuncs; i++)
+        fprintf(stderr," %s/%d", sym.funcs[i].name, sym.funcs[i].arity);
+    fprintf(stderr,"\n");
 
+    /* ── LLVM setup ─────────────────────────────────────────────────────── */
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
     LLVMInitializeAllTargetInfos();
@@ -693,95 +887,165 @@ int main(int argc, char **argv) {
     LLVMInitializeAllTargetMCs();
     LLVMInitializeAllAsmPrinters();
 
-    LLVMContextRef ctx=LLVMContextCreate();
-    LLVMModuleRef  mod=LLVMModuleCreateWithNameInContext("haskell",ctx);
-    LLVMBuilderRef bldr=LLVMCreateBuilderInContext(ctx);
+    LLVMContextRef ctx  = LLVMContextCreate();
+    LLVMModuleRef  mod  = LLVMModuleCreateWithNameInContext("haskell", ctx);
+    LLVMBuilderRef bldr = LLVMCreateBuilderInContext(ctx);
     char *triple = LLVMGetDefaultTargetTriple();
     LLVMSetTarget(mod, triple);
 
-    /* Set the data layout from the actual target machine so that alignment
-     * decisions in codegen (alloca, store, load) are consistent with what
-     * MCJIT uses at runtime.  Without this the module has no datalayout and
-     * LLVM's default gives i64 ABI alignment of 4, causing the JIT to
-     * misread 64-bit values stored by the generated code. */
-    LLVMTargetRef target_ref = NULL;
-    char *layout_err = NULL;
+    LLVMTargetRef  target_ref = NULL;
+    char          *layout_err = NULL;
+    LLVMTargetMachineRef tm   = NULL;
+
     if (!LLVMGetTargetFromTriple(triple, &target_ref, &layout_err)) {
-        LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
-            target_ref, triple, "", "",
-            LLVMCodeGenLevelDefault, LLVMRelocDefault, LLVMCodeModelDefault);
+        /* Use PIC relocation when -fPIC was passed or when building -shared,
+           otherwise default.  PIC is also safer for cmake's object files. */
+        LLVMRelocMode reloc = LLVMRelocPIC; /* always PIC — safest default */
+        tm = LLVMCreateTargetMachine(
+                target_ref, triple, "", "",
+                LLVMCodeGenLevelDefault, reloc, LLVMCodeModelDefault);
         LLVMTargetDataRef dl = LLVMCreateTargetDataLayout(tm);
         LLVMSetModuleDataLayout(mod, dl);
         LLVMDisposeTargetData(dl);
-        LLVMDisposeTargetMachine(tm);
+        /* tm kept alive for object emission below */
     }
     LLVMDisposeMessage(layout_err);
     LLVMDisposeMessage(triple);
 
-    CG cg={.ctx=ctx,.mod=mod,.b=bldr,
-           .i64=LLVMInt64TypeInContext(ctx),
-           .i32=LLVMInt32TypeInContext(ctx),
-           .src=src};
+    CG cg = { .ctx=ctx, .mod=mod, .b=bldr,
+              .i64=LLVMInt64TypeInContext(ctx),
+              .i32=LLVMInt32TypeInContext(ctx),
+              .src=src };
 
     predeclare(&cg);
-    second_pass(&cg,root);
-    emit_main(&cg);
+    second_pass(&cg, root);
 
-    /* --dump-dir: write CST and IR before verification/execution.
-     * Done unconditionally so artifacts are present even if codegen is wrong. */
-    if(dump_dir){
-        mkdir(dump_dir, 0755); /* ignore error if it already exists */
+    /* Only emit the C-main wrapper when we're producing an executable or
+       running via JIT.  In -c (compile-only) mode we emit the Haskell
+       functions as plain symbols so the link step can combine them. */
+    if (!do_compile_only && !do_assemble_only)
+        emit_main(&cg);
 
+    /* ── optional debug dumps ─────────────────────────────────────────── */
+    if (dump_dir) {
+        mkdir(dump_dir, 0755);
         char path[4096];
+
         snprintf(path, sizeof path, "%s/cst.txt", dump_dir);
         FILE *cst_f = fopen(path, "w");
-        if(cst_f){
-            dump(root, src, 0, cst_f);
-            fclose(cst_f);
-        } else {
-            fprintf(stderr, "warning: could not write %s\n", path);
-        }
+        if (cst_f) { dump(root, src, 0, cst_f); fclose(cst_f); }
+        else fprintf(stderr, "warning: could not write %s\n", path);
 
         snprintf(path, sizeof path, "%s/ir.ll", dump_dir);
-        char *dump_err = NULL;
-        if(LLVMPrintModuleToFile(mod, path, &dump_err))
-            fprintf(stderr, "warning: could not write %s: %s\n", path, dump_err?dump_err:"");
-        LLVMDisposeMessage(dump_err);
+        char *de = NULL;
+        if (LLVMPrintModuleToFile(mod, path, &de))
+            fprintf(stderr, "warning: could not write %s: %s\n", path, de?de:"");
+        LLVMDisposeMessage(de);
     }
 
-    char *err=NULL;
-    if(LLVMVerifyModule(mod,LLVMPrintMessageAction,&err))
-        fprintf(stderr,"LLVM verify error: %s\n",err?err:"");
-    else
-        fprintf(stderr,"Module verified OK\n");
-    LLVMDisposeMessage(err);
+    /* ── verify ───────────────────────────────────────────────────────── */
+    {
+        char *err = NULL;
+        if (LLVMVerifyModule(mod, LLVMPrintMessageAction, &err))
+            fprintf(stderr, "qdhc: LLVM verify error: %s\n", err ? err : "");
+        LLVMDisposeMessage(err);
+    }
 
-    if(do_run){
+    /* ── JIT run (--run legacy mode) ──────────────────────────────────── */
+    if (do_run) {
         LLVMLinkInMCJIT();
-        LLVMExecutionEngineRef engine=NULL;
-        char *jit_err=NULL;
-        if(LLVMCreateMCJITCompilerForModule(&engine,mod,NULL,0,&jit_err)){
-            fprintf(stderr,"JIT error: %s\n",jit_err?jit_err:"");
+        LLVMExecutionEngineRef engine = NULL;
+        char *jit_err = NULL;
+        if (LLVMCreateMCJITCompilerForModule(&engine, mod, NULL, 0, &jit_err)) {
+            fprintf(stderr, "qdhc: JIT error: %s\n", jit_err ? jit_err : "");
             LLVMDisposeMessage(jit_err);
+            if (tm) LLVMDisposeTargetMachine(tm);
             LLVMDisposeBuilder(bldr); LLVMContextDispose(ctx);
             ts_tree_delete(tree); ts_parser_delete(parser); free(src);
             return 1;
         }
-        /* mod is now owned by engine */
-        LLVMValueRef main_fn=LLVMGetNamedFunction(mod,"main");
-        int rc=LLVMRunFunctionAsMain(engine,main_fn,0,NULL,NULL);
+        LLVMValueRef main_fn = LLVMGetNamedFunction(mod, "main");
+        int rc = LLVMRunFunctionAsMain(engine, main_fn, 0, NULL, NULL);
         LLVMDisposeExecutionEngine(engine);
+        /* engine took ownership of mod */
+        if (tm) LLVMDisposeTargetMachine(tm);
         LLVMContextDispose(ctx); LLVMDisposeBuilder(bldr);
         ts_tree_delete(tree); ts_parser_delete(parser); free(src);
+        free(outp_buf);
         return rc;
     }
 
-    err=NULL;
-    if(LLVMPrintModuleToFile(mod,outp,&err))
-        fprintf(stderr,"write error: %s\n",err);
-    LLVMDisposeMessage(err);
+    /* ── -S: emit LLVM IR as the "assembly" output ────────────────────── */
+    if (do_assemble_only) {
+        char *err = NULL;
+        if (LLVMPrintModuleToFile(mod, outp, &err))
+            fprintf(stderr, "qdhc: write error: %s\n", err);
+        LLVMDisposeMessage(err);
+        goto done;
+    }
 
+    /* ── -c: emit native object file ──────────────────────────────────── */
+    if (do_compile_only) {
+        if (!tm) {
+            fprintf(stderr, "qdhc: cannot create target machine for object emission\n");
+            goto fail;
+        }
+        char *err = NULL;
+        if (LLVMTargetMachineEmitToFile(tm, mod, (char*)outp,
+                                        LLVMObjectFile, &err)) {
+            fprintf(stderr, "qdhc: object emit error: %s\n", err ? err : "");
+            LLVMDisposeMessage(err);
+            goto fail;
+        }
+        goto done;
+    }
+
+    /* ── no -c: compile + link into an executable ─────────────────────── */
+    /* Strategy: emit a temporary .o, then invoke cc to link it. */
+    {
+        char tmp_obj[] = "/tmp/qdhc_XXXXXX.o";
+        int fd = mkstemps(tmp_obj, 2);
+        if (fd < 0) { perror("mkstemps"); goto fail; }
+        close(fd);
+
+        if (!tm) {
+            fprintf(stderr, "qdhc: cannot create target machine\n");
+            unlink(tmp_obj); goto fail;
+        }
+        char *err = NULL;
+        if (LLVMTargetMachineEmitToFile(tm, mod, tmp_obj, LLVMObjectFile, &err)) {
+            fprintf(stderr, "qdhc: object emit error: %s\n", err ? err : "");
+            LLVMDisposeMessage(err);
+            unlink(tmp_obj); goto fail;
+        }
+
+        /* Link: cc -o <outp> <tmp_obj> */
+        const char *cc = getenv("QDHC_CC");
+        if (!cc || !*cc) cc = "cc";
+        char *link_argv[8];
+        link_argv[0] = (char*)cc;
+        link_argv[1] = "-o"; link_argv[2] = (char*)outp;
+        link_argv[3] = tmp_obj;
+        link_argv[4] = NULL;
+        pid_t pid = fork();
+        if (pid == 0) { execvp(cc, link_argv); perror(cc); exit(1); }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        unlink(tmp_obj);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) goto fail;
+    }
+
+done:
+    if (tm) LLVMDisposeTargetMachine(tm);
     LLVMDisposeBuilder(bldr); LLVMDisposeModule(mod); LLVMContextDispose(ctx);
     ts_tree_delete(tree); ts_parser_delete(parser); free(src);
+    free(outp_buf);
     return 0;
+
+fail:
+    if (tm) LLVMDisposeTargetMachine(tm);
+    LLVMDisposeBuilder(bldr); LLVMDisposeModule(mod); LLVMContextDispose(ctx);
+    ts_tree_delete(tree); ts_parser_delete(parser); free(src);
+    free(outp_buf);
+    return 1;
 }

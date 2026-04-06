@@ -33,9 +33,13 @@ stdenv.mkDerivation (finalAttrs: {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 qdhc "$out/bin/qdhc"
+    make install PREFIX="$out"
     runHook postInstall
   '';
+
+  # Let downstream packages reference the cmake modules directory:
+  #   list(APPEND CMAKE_MODULE_PATH "${pkgs.qdhc.cmakeModulesDir}")
+  passthru.cmakeModulesDir = "${placeholder "out"}/share/qdhc/cmake";
 
   meta = {
     description = "A compiler for a Haskell subset using tree-sitter + LLVM";

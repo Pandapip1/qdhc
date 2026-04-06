@@ -4,7 +4,7 @@ LLVM_CFG = llvm-config
 
 LLVM_CFLAGS  := $(shell $(LLVM_CFG) --cflags)
 LLVM_LDFLAGS := $(shell $(LLVM_CFG) --ldflags)
-LLVM_LIBS    := $(shell $(LLVM_CFG) --libs core analysis bitwriter passes mcjit executionengine native)
+LLVM_LIBS    := $(shell $(LLVM_CFG) --libs core analysis bitwriter passes mcjit executionengine native codegen object)
 
 TS_DIR = grammar/src
 
@@ -12,7 +12,11 @@ CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter \
          -I$(TS_DIR) \
          $(LLVM_CFLAGS)
 
-.PHONY: all clean test
+PREFIX      ?= /usr/local
+BINDIR      ?= $(PREFIX)/bin
+CMAKEDIR    ?= $(PREFIX)/share/qdhc/cmake
+
+.PHONY: all clean test install uninstall
 
 all: qdhc
 
@@ -112,3 +116,20 @@ module M where\n-- a comment\nadd x y = x + y\nmain = let r = add 19 23 in r,42)
 clean:
 	rm -f *.o qdhc
 	rm -rf _testout
+
+install: qdhc
+	install -Dm755 qdhc "$(DESTDIR)$(BINDIR)/qdhc"
+	ln -sf qdhc         "$(DESTDIR)$(BINDIR)/hc"
+	install -Dm644 cmake/CMakeDetermineHaskellCompiler.cmake \
+	    "$(DESTDIR)$(CMAKEDIR)/CMakeDetermineHaskellCompiler.cmake"
+	install -Dm644 cmake/CMakeHaskellCompiler.cmake.in \
+	    "$(DESTDIR)$(CMAKEDIR)/CMakeHaskellCompiler.cmake.in"
+	install -Dm644 cmake/CMakeHaskellInformation.cmake \
+	    "$(DESTDIR)$(CMAKEDIR)/CMakeHaskellInformation.cmake"
+	install -Dm644 cmake/CMakeTestHaskellCompiler.cmake \
+	    "$(DESTDIR)$(CMAKEDIR)/CMakeTestHaskellCompiler.cmake"
+
+uninstall:
+	rm -f  "$(DESTDIR)$(BINDIR)/qdhc"
+	rm -f  "$(DESTDIR)$(BINDIR)/hc"
+	rm -rf "$(DESTDIR)$(CMAKEDIR)"

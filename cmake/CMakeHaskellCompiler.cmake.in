@@ -1,0 +1,35 @@
+# CMakeHaskellCompiler.cmake.in
+# This file is configured into <build>/CMakeFiles/CMakeHaskellCompiler.cmake
+# and re-loaded on subsequent cmake runs to avoid rediscovery.
+
+set(CMAKE_Haskell_COMPILER          "@CMAKE_Haskell_COMPILER@")
+set(CMAKE_Haskell_COMPILER_ARG1     "@CMAKE_Haskell_COMPILER_ARG1@")
+set(CMAKE_Haskell_COMPILER_ID       "@CMAKE_Haskell_COMPILER_ID@")
+set(CMAKE_Haskell_COMPILER_ENV_VAR  "HC")
+
+set(CMAKE_Haskell_COMPILER_LOADED   1)
+set(CMAKE_Haskell_COMPILER_ID_RUN   1)
+
+# .hs is the source extension for this language.
+set(CMAKE_Haskell_SOURCE_FILE_EXTENSIONS hs)
+
+# Extensions cmake should ignore when scanning for sources.
+set(CMAKE_Haskell_IGNORE_EXTENSIONS  h;hi;o;obj)
+
+# Output extension for compiled objects.
+if(UNIX)
+  set(CMAKE_Haskell_OUTPUT_EXTENSION .o)
+else()
+  set(CMAKE_Haskell_OUTPUT_EXTENSION .obj)
+endif()
+
+# Linker preference — higher value wins when mixed-language targets are linked.
+# Set lower than C (10) and C++ (30) so that a target with both Haskell and C
+# sources will link via the C compiler (which knows about the C runtime).
+set(CMAKE_Haskell_LINKER_PREFERENCE            5)
+set(CMAKE_Haskell_LINKER_PREFERENCE_PROPAGATES 0)
+
+# Tell cmake the compiler works and skip the ABI probe (no C runtime needed).
+set(CMAKE_Haskell_COMPILER_WORKS    TRUE)
+set(CMAKE_Haskell_ABI_COMPILED      FALSE)
+set(CMAKE_Haskell_COMPILER_FORCED   TRUE)
