@@ -39,11 +39,6 @@ stdenv.mkDerivation (finalAttrs: {
 
   meta = {
     description = "A compiler for a Haskell subset using tree-sitter + LLVM";
-    longDescription = ''
-      Compiles a subset of Haskell (integers, arithmetic, recursion,
-      if/then/else, let/in, multi-arg functions) to LLVM IR, which can then
-      be JIT-executed with llc or compiled to a native binary with llc + cc.
-    '';
     license = lib.licenses.mit;
     platforms = lib.platforms.all;
     mainProgram = "qdhc";
