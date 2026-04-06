@@ -9,8 +9,10 @@
 {
   lib,
   stdenv,
+  cmake,
   libllvm,
   tree-sitter,
+  pkg-config,
 }:
 
 stdenv.mkDerivation (finalAttrs: {
@@ -21,25 +23,20 @@ stdenv.mkDerivation (finalAttrs: {
 
   strictDeps = true;
   nativeBuildInputs = [
+    cmake
+    pkg-config
     libllvm
   ];
   buildInputs = [
     libllvm
-    tree-sitter 
+    tree-sitter
+  ];
+
+  cmakeFlags = [
+    (lib.cmakeFeature "QDHC_CMAKE_DIR" "${placeholder "out"}/share/qdhc/cmake")
   ];
 
   doCheck = true;
-  checkTarget = "test";
-
-  installPhase = ''
-    runHook preInstall
-    make install PREFIX="$out"
-    runHook postInstall
-  '';
-
-  # Let downstream packages reference the cmake modules directory:
-  #   list(APPEND CMAKE_MODULE_PATH "${pkgs.qdhc.cmakeModulesDir}")
-  passthru.cmakeModulesDir = "${placeholder "out"}/share/qdhc/cmake";
 
   meta = {
     description = "A compiler for a Haskell subset using tree-sitter + LLVM";
