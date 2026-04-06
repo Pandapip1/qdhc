@@ -121,71 +121,12 @@ install(FILES
 
 enable_testing()
 
-# Tests are defined as three parallel lists: names, sources, expected outputs.
-#
-# IMPORTANT: cmake's list() always splits on semicolons, even inside strings
-# set with quotes.  The Haskell sources contain semicolons (e.g. let { a=1; b=2 })
-# so we must NOT store them in a single flat list.  Parallel lists with one
-# cmake variable per field sidestep this entirely.
-#
-# Newlines in sources are encoded as the two-character sequence \n and expanded
-# with string(REPLACE) just before file(WRITE).
+# Each test is a self-contained .hs file in tests/ that exits 0 on pass, 1 on
+# fail.  To add a test, just drop a new .hs file into tests/.
 
-set(T_NAMES "")
-set(T_SRCS  "")
-set(T_EXPRS "")
+file(GLOB _test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.hs")
 
-macro(add_hs_test name src expected)
-  list(APPEND T_NAMES "${name}")
-  list(APPEND T_SRCS  "${src}")
-  list(APPEND T_EXPRS "${expected}")
-endmacro()
-
-add_hs_test(addition           "module M where\nmain = let r = 3 + 4 in r"          7)
-add_hs_test(subtraction        "module M where\nmain = let r = 10 - 3 in r"         7)
-add_hs_test(multiplication     "module M where\nmain = let r = 3 * 7 in r"          21)
-add_hs_test(div                "module M where\nmain = let r = 42 `div` 6 in r"     7)
-add_hs_test(mod                "module M where\nmain = let r = 17 `mod` 5 in r"     2)
-add_hs_test(negation           "module M where\nmain = let r = (-7) in r"           -7)
-add_hs_test(eq-true            "module M where\nmain = let r = if 3 == 3 then 1 else 0 in r" 1)
-add_hs_test(eq-false           "module M where\nmain = let r = if 3 == 4 then 1 else 0 in r" 0)
-add_hs_test(neq                "module M where\nmain = let r = if 3 /= 4 then 1 else 0 in r" 1)
-add_hs_test(lt                 "module M where\nmain = let r = if 2 < 5 then 1 else 0 in r"  1)
-add_hs_test(gte                "module M where\nmain = let r = if 9 >= 9 then 1 else 0 in r" 1)
-add_hs_test(double             "module M where\ndouble x = x + x\nmain = let r = double 21 in r" 42)
-add_hs_test(sub-in-body        "module M where\nf n = n - 1\nmain = let r = f 8 in r"       7)
-add_hs_test(sub-in-parens      "module M where\nf n = n * (n - 1)\nmain = let r = f 5 in r" 20)
-add_hs_test(factorial-5        "module M where\nf n = if n == 0 then 1 else n * f (n - 1)\nmain = let r = f 5 in r"  120)
-add_hs_test(factorial-10       "module M where\nf n = if n == 0 then 1 else n * f (n - 1)\nmain = let r = f 10 in r" 3628800)
-add_hs_test(fib-10             "module M where\nfib n = if n <= 1 then n else fib (n-1) + fib (n-2)\nmain = let r = fib 10 in r" 55)
-add_hs_test(add-2arg           "module M where\nadd x y = x + y\nmain = let r = add 19 23 in r"      42)
-add_hs_test(mul3-3arg          "module M where\nmul3 x y z = x * y * z\nmain = let r = mul3 2 3 7 in r" 42)
-add_hs_test(sign-pos           "module M where\ns n = if n > 0 then 1 else if n < 0 then -1 else 0\nmain = let r = s 99 in r"   1)
-add_hs_test(sign-neg           "module M where\ns n = if n > 0 then 1 else if n < 0 then -1 else 0\nmain = let r = s (-5) in r" -1)
-add_hs_test(sign-zero          "module M where\ns n = if n > 0 then 1 else if n < 0 then -1 else 0\nmain = let r = s 0 in r"    0)
-add_hs_test(let-multi          "module M where\nmain = let { a = 6[SEMI] b = 7 } in a * b" 42)
-add_hs_test(let-dep            "module M where\nmain = let { x = 10[SEMI] y = x + 32 } in y" 42)
-add_hs_test(comment-before-decl "module M where\n-- a comment\nadd x y = x + y\nmain = let r = add 19 23 in r" 42)
-
-list(LENGTH T_NAMES _ntest)
-set(_i 0)
-while(_i LESS _ntest)
-  list(GET T_NAMES ${_i} _name)
-  list(GET T_SRCS  ${_i} _src)
-  list(GET T_EXPRS ${_i} _expected)
-  math(EXPR _i "${_i} + 1")
-
-  # Expand \n to real newlines, then restore semicolons from the [SEMI] placeholder
-  string(REPLACE "\\n" "\n" _src "${_src}")
-  string(REPLACE "[SEMI]" ";" _src "${_src}")
-
-  set(_input_file "${CMAKE_CURRENT_BINARY_DIR}/testinput/${_name}.hs")
-  file(WRITE "${_input_file}" "${_src}\n")
-
-  add_test(NAME "qdhc_${_name}" COMMAND qdhc --run "${_input_file}")
-  # ctest concatenates stdout+stderr and matches the full string; \n is a
-  # literal newline in the regex, which correctly anchors the expected value.
-  set_tests_properties("qdhc_${_name}" PROPERTIES
-    PASS_REGULAR_EXPRESSION "\n${_expected}\n"
-  )
-endwhile()
+foreach(_hs_file ${_test_sources})
+  get_filename_component(_name "${_hs_file}" NAME_WE)
+  add_test(NAME "qdhc_${_name}" COMMAND qdhc --run "${_hs_file}")
+endforeach()

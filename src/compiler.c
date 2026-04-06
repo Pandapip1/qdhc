@@ -249,54 +249,158 @@ static LLVMValueRef cg_var(CG *cg, TSNode n) {
     exit(1);
 }
 
-static LLVMValueRef cg_infix(CG *cg, TSNode n) {
-    TSNode ln=fchild(n,"left_operand"), opn=fchild(n,"operator"), rn=fchild(n,"right_operand");
-    /* Grammar quirk: inside parens, `n - 1` omits left_operand/right_operand field tags.
-       Children are positional: [0]=LHS [1]=op(no field) [2]=RHS.
-       Also the named `operator` field sometimes points to the RHS literal, not the op symbol.
-       Detect this and fall back to positional scanning. */
-    if(nn(ln)||nn(rn)){
-        uint32_t nc=ts_node_child_count(n);
-        if(nc>=3){ ln=ts_node_child(n,0); opn=ts_node_child(n,1); rn=ts_node_child(n,2); }
-    } else if(!nn(opn)){
-        /* operator field may point to the RHS literal instead of the symbol;
-           the real symbol is child[1] with no field tag */
-        const char *opt=ts_node_type(opn);
-        if(strcmp(opt,"operator")!=0){
-            /* real op is the unnamed child between LHS and RHS */
-            uint32_t nc=ts_node_child_count(n);
-            for(uint32_t i=0;i<nc;i++){
-                const char *fn=ts_node_field_name_for_child(n,i);
-                if(!fn) { opn=ts_node_child(n,i); break; }
-            }
+/* ── Infix operator precedence ──────────────────────────────────────────────
+ *
+ * tree-sitter-haskell (≤0.20.x) does NOT encode operator precedence in the
+ * CST.  Every infix chain is right-associative and flat:
+ *   "3 + 4 * 2 == 11"  →  infix(3, +, infix(4, *, infix(2, ==, 11)))
+ * which is wrong.  We must re-linearise and re-parse with Haskell's actual
+ * precedence / associativity table.
+ *
+ * Strategy:
+ *   1. Walk the right-spine of nested `infix` nodes to collect a flat list:
+ *        operands: [e0, e1, e2, ...]   (TSNodes, not yet compiled)
+ *        operators: [op1, op2, ...]    (strings)
+ *   2. Run precedence-climbing on that list to produce correct nesting.
+ *   3. Compile the resulting tree bottom-up.
+ */
+
+typedef struct InfixChain {
+    TSNode  *operands;   /* length = n   */
+    char   **operators;  /* length = n-1 */
+    int      n;
+} InfixChain;
+
+static int op_prec(const char *op) {
+    /* Haskell 2010 fixity table (default infixl 9 for unknowns) */
+    if (!strcmp(op,"||"))                           return 2;
+    if (!strcmp(op,"&&"))                           return 3;
+    if (!strcmp(op,"==")||!strcmp(op,"/=")||
+        !strcmp(op,"<") ||!strcmp(op,"<=") ||
+        !strcmp(op,">") ||!strcmp(op,">="))         return 4;
+    if (!strcmp(op,"+") ||!strcmp(op,"-"))          return 6;
+    if (!strcmp(op,"*") ||!strcmp(op,"/"))          return 7;
+    if (!strcmp(op,"div")  ||!strcmp(op,"`div`") ||
+        !strcmp(op,"mod")  ||!strcmp(op,"`mod`") ||
+        !strcmp(op,"quot") ||!strcmp(op,"`quot`")||
+        !strcmp(op,"rem")  ||!strcmp(op,"`rem`"))   return 7;
+    return 9; /* default */
+}
+
+static bool op_is_right(const char *op) {
+    (void)op; /* all ops we handle are left-associative */
+    return false;
+}
+
+/* Extract the operator text from an operator node (handles both `operator`
+   type and `infix_id` type like `div`). */
+static char *op_text(TSNode opn, const char *src) {
+    if (nn(opn)) return strdup("?");
+    const char *t = nt(opn);
+    if (!strcmp(t, "infix_id")) {
+        /* `div` — the variable child holds the name */
+        uint32_t nc = ts_node_child_count(opn);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_child(opn, i);
+            if (named(c) && !strcmp(nt(c), "variable"))
+                return node_text(c, src);
         }
     }
-    if(nn(ln)||nn(rn)){
-        fprintf(stderr,"warning: infix missing operand\n");
-        return LLVMConstInt(cg->i64,0,0);
+    return node_text(opn, src);
+}
+
+/* Walk the right-spine of nested infix nodes, appending to chain. */
+static void collect_infix_chain(TSNode n, const char *src, InfixChain *ch) {
+    if (nn(n) || strcmp(nt(n), "infix") != 0) {
+        /* leaf operand */
+        ch->operands  = realloc(ch->operands,  sizeof(TSNode) * (ch->n + 1));
+        ch->operands[ch->n] = n;
+        ch->n++;
+        return;
     }
-    LLVMValueRef l=cg_expr(cg,ln), r=cg_expr(cg,rn);
-    char *op=nn(opn)?strdup("?"):node_text(opn,cg->src);
-    LLVMValueRef res;
-    if     (!strcmp(op,"+"))  res=LLVMBuildAdd (cg->b,l,r,"add");
-    else if(!strcmp(op,"-"))  res=LLVMBuildSub (cg->b,l,r,"sub");
-    else if(!strcmp(op,"*"))  res=LLVMBuildMul (cg->b,l,r,"mul");
-    else if(!strcmp(op,"/"))  res=LLVMBuildSDiv(cg->b,l,r,"div");
-    else if(!strcmp(op,"div")||!strcmp(op,"`div`")) res=LLVMBuildSDiv(cg->b,l,r,"div");
-    else if(!strcmp(op,"mod")||!strcmp(op,"`mod`")) res=LLVMBuildSRem(cg->b,l,r,"mod");
-    else if(!strcmp(op,"quot")||!strcmp(op,"`quot`")) res=LLVMBuildSDiv(cg->b,l,r,"quot");
-    else if(!strcmp(op,"rem")||!strcmp(op,"`rem`")) res=LLVMBuildSRem(cg->b,l,r,"rem");
-    else if(!strcmp(op,"==")){ LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntEQ, l,r,"eq"); res=LLVMBuildZExt(cg->b,c,cg->i64,"eqi"); }
-    else if(!strcmp(op,"/=")){ LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntNE, l,r,"ne"); res=LLVMBuildZExt(cg->b,c,cg->i64,"nei"); }
-    else if(!strcmp(op,"<")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSLT,l,r,"lt"); res=LLVMBuildZExt(cg->b,c,cg->i64,"lti"); }
-    else if(!strcmp(op,"<=")){ LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSLE,l,r,"le"); res=LLVMBuildZExt(cg->b,c,cg->i64,"lei"); }
-    else if(!strcmp(op,">")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSGT,l,r,"gt"); res=LLVMBuildZExt(cg->b,c,cg->i64,"gti"); }
-    else if(!strcmp(op,">=")){ LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSGE,l,r,"ge"); res=LLVMBuildZExt(cg->b,c,cg->i64,"gei"); }
-    else if(!strcmp(op,"&&")) res=LLVMBuildAnd(cg->b,l,r,"and");
-    else if(!strcmp(op,"||")) res=LLVMBuildOr (cg->b,l,r,"or");
-    else { fprintf(stderr,"error: unsupported operator '%s'\n",op);
-           free(op); exit(1); }
-    free(op); return res;
+    TSNode ln  = fchild(n, "left_operand");
+    TSNode opn = fchild(n, "operator");
+    TSNode rn  = fchild(n, "right_operand");
+
+    /* Positional fallback (same quirk as before) */
+    if (nn(ln) || nn(rn)) {
+        uint32_t nc = ts_node_child_count(n);
+        if (nc >= 3) { ln = ts_node_child(n,0); opn = ts_node_child(n,1); rn = ts_node_child(n,2); }
+    } else if (!nn(opn) && strcmp(nt(opn), "operator") != 0 && strcmp(nt(opn), "infix_id") != 0) {
+        uint32_t nc = ts_node_child_count(n);
+        for (uint32_t i = 0; i < nc; i++) {
+            const char *fn = ts_node_field_name_for_child(n, i);
+            if (!fn) { opn = ts_node_child(n, i); break; }
+        }
+    }
+
+    /* Left operand is always a leaf (tree-sitter puts it directly here) */
+    ch->operands  = realloc(ch->operands,  sizeof(TSNode) * (ch->n + 1));
+    ch->operands[ch->n] = ln;
+    ch->n++;
+
+    ch->operators = realloc(ch->operators, sizeof(char*) * (ch->n));
+    ch->operators[ch->n - 1] = op_text(opn, src);
+
+    /* Recurse into right child */
+    collect_infix_chain(rn, src, ch);
+}
+
+/* Precedence-climbing: compile operands[lo..hi] with operators[lo..hi-1].
+   Returns an LLVMValueRef for the sub-expression. */
+static LLVMValueRef compile_infix_range(CG *cg, InfixChain *ch, int lo, int hi);
+
+static LLVMValueRef apply_op(CG *cg, const char *op, LLVMValueRef l, LLVMValueRef r) {
+    if      (!strcmp(op,"+"))   return LLVMBuildAdd (cg->b,l,r,"add");
+    else if (!strcmp(op,"-"))   return LLVMBuildSub (cg->b,l,r,"sub");
+    else if (!strcmp(op,"*"))   return LLVMBuildMul (cg->b,l,r,"mul");
+    else if (!strcmp(op,"/"))   return LLVMBuildSDiv(cg->b,l,r,"div");
+    else if (!strcmp(op,"div") ||!strcmp(op,"`div`"))  return LLVMBuildSDiv(cg->b,l,r,"div");
+    else if (!strcmp(op,"mod") ||!strcmp(op,"`mod`"))  return LLVMBuildSRem(cg->b,l,r,"mod");
+    else if (!strcmp(op,"quot")||!strcmp(op,"`quot`")) return LLVMBuildSDiv(cg->b,l,r,"quot");
+    else if (!strcmp(op,"rem") ||!strcmp(op,"`rem`"))  return LLVMBuildSRem(cg->b,l,r,"rem");
+    else if (!strcmp(op,"==")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntEQ, l,r,"eq"); return LLVMBuildZExt(cg->b,c,cg->i64,"eqi"); }
+    else if (!strcmp(op,"/=")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntNE, l,r,"ne"); return LLVMBuildZExt(cg->b,c,cg->i64,"nei"); }
+    else if (!strcmp(op,"<"))  { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSLT,l,r,"lt"); return LLVMBuildZExt(cg->b,c,cg->i64,"lti"); }
+    else if (!strcmp(op,"<=")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSLE,l,r,"le"); return LLVMBuildZExt(cg->b,c,cg->i64,"lei"); }
+    else if (!strcmp(op,">"))  { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSGT,l,r,"gt"); return LLVMBuildZExt(cg->b,c,cg->i64,"gti"); }
+    else if (!strcmp(op,">=")) { LLVMValueRef c=LLVMBuildICmp(cg->b,LLVMIntSGE,l,r,"ge"); return LLVMBuildZExt(cg->b,c,cg->i64,"gei"); }
+    else if (!strcmp(op,"&&")) return LLVMBuildAnd(cg->b,l,r,"and");
+    else if (!strcmp(op,"||")) return LLVMBuildOr (cg->b,l,r,"or");
+    else { fprintf(stderr,"error: unsupported operator '%s'\n",op); exit(1); }
+}
+
+static LLVMValueRef compile_infix_range(CG *cg, InfixChain *ch, int lo, int hi) {
+    /* Single operand */
+    if (lo == hi) return cg_expr(cg, ch->operands[lo]);
+
+    /* Find the lowest-precedence operator in [lo, hi-1], right-to-left for
+       left-associative ops (so we fold left), left-to-right for right-assoc. */
+    int split = lo;
+    int min_prec = op_prec(ch->operators[lo]);
+    for (int i = lo + 1; i < hi; i++) {
+        int p = op_prec(ch->operators[i]);
+        if (op_is_right(ch->operators[i]) ? p < min_prec : p <= min_prec) {
+            min_prec = p;
+            split = i;
+        }
+    }
+
+    LLVMValueRef l = compile_infix_range(cg, ch, lo, split);
+    LLVMValueRef r = compile_infix_range(cg, ch, split + 1, hi);
+    return apply_op(cg, ch->operators[split], l, r);
+}
+
+static LLVMValueRef cg_infix(CG *cg, TSNode n) {
+    InfixChain ch = {NULL, NULL, 0};
+    collect_infix_chain(n, cg->src, &ch);
+
+    LLVMValueRef result = compile_infix_range(cg, &ch, 0, ch.n - 1);
+
+    for (int i = 0; i < ch.n - 1; i++) free(ch.operators[i]);
+    free(ch.operators);
+    free(ch.operands);
+    return result;
 }
 
 static LLVMValueRef cg_if(CG *cg, TSNode n) {
